@@ -1,0 +1,20 @@
+# ROS Build artifacts
+build/
+devel/
+install/
+
+# Large data files
+ces/MOT/bag/
+ces/MOT/pretrained/
+
+# Python virtual environments & caches
+venv/
+*.pyc
+__pycache__/
+
+# Library source code (installed via pip)
+ces/ultralytics/
+
+# IDE settings
+.vscode/
+.idea/

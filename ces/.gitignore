@@ -1,0 +1,40 @@
+# =========================
+# Large data / datasets
+# =========================
+ces/MOT/bag/
+ces/MOT/pretrained/
+
+# =========================
+# Vendored libs (if installed via pip)
+# =========================
+ces/ultralytics/
+
+# =========================
+# ROS build artifacts (catkin/colcon)
+# =========================
+build/
+devel/
+install/
+log/
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.env
+*.egg-info/
+.dist-info/
+.pytest_cache/
+.mypy_cache/
+
+# =========================
+# IDE / OS
+# =========================
+.vscode/
+.idea/
+.DS_Store
