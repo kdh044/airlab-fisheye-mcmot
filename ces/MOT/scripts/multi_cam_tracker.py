@@ -13,6 +13,35 @@ from cv_bridge import CvBridge
 from ultralytics import YOLO
 from scipy.optimize import linear_sum_assignment
 
+# ========== 튜닝 파라미터 ==========
+CONFIG = {
+    # YOLO 검출
+    'yolo_conf_thresh': 0.2,
+    
+    # 프레임 내 그룹핑 (같은 문 판단)
+    'fusion_eps': 0.7,
+    
+    # DoorMap
+    'door_conf_thresh': 0.25,
+    'match_dist_tentative': 0.45,
+    'match_dist_confirmed': 0.60,
+    'min_observations': 5,
+    'ttl_tentative': 5.0,
+    'ttl_confirmed': 60.0,
+    'cluster_merge_dist': 0.5,
+    
+    # Handle 귀속
+    'handle_min_containment': 0.3,
+    
+    # 프레임 동기화
+    'sync_threshold': 0.05,
+    
+    # 월드 좌표 (카메라 높이)
+    'ground_height': 1.7,
+}
+# ==================================
+
+
 def compute_iou(box1, box2):
     x1 = max(box1[0], box2[0]); y1 = max(box1[1], box2[1])
     x2 = min(box1[2], box2[2]); y2 = min(box1[3], box2[3])
@@ -21,6 +50,7 @@ def compute_iou(box1, box2):
     area2 = (box2[2]-box2[0]) * (box2[3]-box2[1])
     union = area1 + area2 - inter
     return inter/union if union > 0 else 0.0
+
 
 def non_max_suppression(boxes, scores, iou_threshold):
     if len(boxes) == 0: return []
@@ -33,9 +63,55 @@ def non_max_suppression(boxes, scores, iou_threshold):
         indices = indices[remaining_indices + 1]
     return keep
 
-def skew(t):
-    tx, ty, tz = float(t[0]), float(t[1]), float(t[2])
-    return np.array([[0, -tz,  ty], [tz,  0, -tx], [-ty, tx,  0]], dtype=float)
+
+def fuse_dets_by_world_pos(dets, eps=None):
+    """프레임 내 det들끼리 월드 (x,z) 기준으로 그룹핑."""
+    if eps is None:
+        eps = CONFIG['fusion_eps']
+    if not dets:
+        return [], []
+    
+    used = [False] * len(dets)
+    representatives = []
+    groups = []
+    
+    for i in range(len(dets)):
+        if used[i]:
+            continue
+        base = dets[i]
+        group = [base]
+        used[i] = True
+        pi = base['pos'][[0, 2]]
+        
+        for j in range(i + 1, len(dets)):
+            if used[j]:
+                continue
+            pj = dets[j]['pos'][[0, 2]]
+            if np.linalg.norm(pi - pj) < eps:
+                used[j] = True
+                group.append(dets[j])
+        
+        rep = max(group, key=lambda d: d['conf'])
+        rep_pos = np.mean([g['pos'] for g in group], axis=0)
+        rep['pos'] = rep_pos
+        rep['fused_count'] = len(group)
+        
+        representatives.append(rep)
+        groups.append(group)
+    
+    return representatives, groups
+
+
+def propagate_gid_to_groups(representatives, groups):
+    """DoorMap에서 할당받은 gid를 그룹 전체 det에 전파."""
+    all_dets = []
+    for rep, group in zip(representatives, groups):
+        gid = rep.get('gid', -1)
+        for det in group:
+            det['gid'] = gid
+            all_dets.append(det)
+    return all_dets
+
 
 class Camera:
     def __init__(self, cid, data, T_global, ground_height):
@@ -53,7 +129,7 @@ class Camera:
         with self._lock:
             if self.map_x is not None: return
             rospy.loginfo(f"[{self.cid}] Initializing maps ({w}x{h})...")
-            scale = 0.5
+            scale = 1.0
             nfx, nfy = self.fx * scale, self.fy * scale
             ncx, ncy = w / 2.0, h / 2.0
             self.K_new = np.array([[nfx, 0, ncx], [0, nfy, ncy], [0, 0, 1]])
@@ -82,127 +158,137 @@ class Camera:
         gp = self.H_inv @ np.array([u, v, 1.0])
         return np.array([gp[0]/gp[2], self.ground_height, gp[1]/gp[2]]) if abs(gp[2]) > 1e-6 else None
 
-class KalmanTracker:
-    def __init__(self, cameras):
-        self.tracks = {}; self.next_gid = 0
-        self.max_dist = 1.5; self.ttl = 3.0; self.iou_gate = 0.1
-        self.high_thresh = 0.25; self.n_init = 3
-        self.q_diag = [0.1, 0.1, 0.2, 0.2]; self.r_val = 0.1
-        self.F_cache = {}
-        self.epipolar_thresh = 15.0
-        self.cameras = cameras # Store cameras reference
 
-    def compute_F(self, cam1, cam2, cameras):
-        if (cam1, cam2) in self.F_cache: return self.F_cache[(cam1, cam2)]
-        c1, c2 = cameras[cam1], cameras[cam2]
-        if c1.K_new is None or c2.K_new is None: return None
-        T_rel = np.linalg.inv(c2.T) @ c1.T
-        R, t = T_rel[:3, :3], T_rel[:3, 3]
-        E = skew(t) @ R
-        K1_inv, K2_inv = np.linalg.inv(c1.K_new), np.linalg.inv(c2.K_new)
-        F = K2_inv.T @ E @ K1_inv
-        self.F_cache[(cam1, cam2)] = F; self.F_cache[(cam2, cam1)] = F.T
-        return F
-
-    def check_epipolar(self, track, det, cameras):
-        cam1, cam2 = track['last_cam'], det['cam']
-        if cam1 == cam2 or cam2 not in cameras[cam1].overlaps: return False
-        F = self.compute_F(cam1, cam2, cameras)
-        if F is None: return False
-        uv1 = np.array([*track['last_uv'], 1.0])
-        uv2 = np.array([*det['uv'], 1.0])
-        l2 = F @ uv1
-        dist = abs(np.dot(uv2, l2)) / np.sqrt(l2[0]**2 + l2[1]**2 + 1e-9)
-        return dist < self.epipolar_thresh
-
-    def update(self, detections, cameras):
+class DoorMap:
+    def __init__(self):
+        self.clusters = {}
+        self.next_gid = 0
+        self.match_dist_tentative = CONFIG['match_dist_tentative']
+        self.match_dist_confirmed = CONFIG['match_dist_confirmed']
+        self.door_conf_thresh = CONFIG['door_conf_thresh']
+        self.min_observations = CONFIG['min_observations']
+        self.ttl_tentative = CONFIG['ttl_tentative']
+        self.ttl_confirmed = CONFIG['ttl_confirmed']
+        
+    def update(self, door_dets):
         now = rospy.Time.now()
-        for t in self.tracks.values(): self.predict(t, now)
-
-        dets_high = [d for d in detections if d['conf'] >= self.high_thresh]
-        dets_low = [d for d in detections if d['conf'] < self.high_thresh]
-        for det in detections: det['gid'] = -1
         
-        track_ids = list(self.tracks.keys())
-        matched_gids = set()
-
-        # 1. Match High Score
-        if dets_high and track_ids:
-            self._match(dets_high, track_ids, matched_gids, now, cameras)
+        valid_dets = [d for d in door_dets if d['conf'] >= self.door_conf_thresh]
+        low_conf_dets = [d for d in door_dets if d['conf'] < self.door_conf_thresh]
+        for d in low_conf_dets:
+            d['gid'] = -1
         
-        # 2. Match Low Score
-        unmatched_gids = [gid for gid in track_ids if gid not in matched_gids]
-        if dets_low and unmatched_gids:
-            self._match(dets_low, unmatched_gids, matched_gids, now, cameras, is_low_score=True)
+        if not valid_dets:
+            self._cleanup(now)
+            return door_dets
         
-        # 3. New Tracks
-        for det in dets_high:
-            if det['gid'] == -1:
-                gid = self.next_gid; self.next_gid += 1; det['gid'] = gid
-                self.tracks[gid] = self._init_track(det, now)
-
-        self._manage_states(now)
-        return detections
-
-    def _match(self, dets, gids, matched_gids, now, cameras, is_low_score=False):
-        if not dets or not gids: return
-        cost = np.full((len(dets), len(gids)), 1e6)
-        for i, det in enumerate(dets):
-            for j, gid in enumerate(gids):
-                track = self.tracks[gid]
-                # Handover Gating
-                if track['last_cam'] != det['cam']:
-                    if track['track_state'] != 'Lost' or not self.check_epipolar(track, det, cameras):
-                        continue
-                cost[i,j] = np.linalg.norm(det['pos'][[0,2]] - track['pos'][[0,2]])
-
-        row, col = linear_sum_assignment(cost)
-        for r, c in zip(row, col):
-            if cost[r,c] > self.max_dist: continue
-            det, gid = dets[r], gids[c]
-            if det['cam'] == self.tracks[gid]['last_cam']:
-                if compute_iou(det['box'], self.tracks[gid]['last_box']) < self.iou_gate: continue
-            
-            det['gid'] = gid; matched_gids.add(gid)
-            self._update_track(self.tracks[gid], det, now)
-            
-    def _init_track(self, det, now):
-        pos = det['pos']
-        return {'pos':pos,'last_seen':now,'state':np.array([pos[0],pos[2],0.0,0.0]),
-                'P':np.eye(4),'track_state':'New','hits':1,'last_cam':det['cam'],
-                'last_uv':det['uv'],'last_box':det['box'],'display_cls':det['cls']}
-
-    def predict(self, track, now):
-        dt = (now - track['last_seen']).to_sec()
-        if dt <= 0: return
-        F = np.eye(4); F[0,2]=dt; F[1,3]=dt
-        Q = np.diag(self.q_diag) * dt
-        track['state'] = F @ track['state']
-        track['P'] = F @ track['P'] @ F.T + Q
-        track['pos'][0], track['pos'][2] = track['state'][0], track['state'][1]
-
-    def _update_track(self, track, det, now):
-        z = det['pos'][[0,2]]
-        H = np.array([[1,0,0,0],[0,1,0,0]])
-        R = np.eye(2) * self.r_val
-        y = z - H @ track['state']
-        S = H @ track['P'] @ H.T + R
-        K = track['P'] @ H.T @ np.linalg.inv(S)
-        track['state'] += K @ y
-        track['P'] = (np.eye(4) - K @ H) @ track['P']
-        track['pos'][0], track['pos'][2] = track['state'][0], track['state'][1]
-        track['last_seen'] = now; track['last_cam'] = det['cam']
-        track['last_uv'] = det['uv']; track['last_box'] = det['box']
-        track['display_cls'] = det['cls']; track['hits'] += 1
-        if track['track_state'] == 'New' and track['hits'] >= self.n_init: track['track_state'] = 'Tracked'
-        elif track['track_state'] == 'Lost': track['track_state'] = 'Tracked'
+        cluster_ids = list(self.clusters.keys())
+        
+        if not cluster_ids:
+            for det in valid_dets:
+                self._create_cluster(det, now)
+            return door_dets
+        
+        n_dets = len(valid_dets)
+        n_clusters = len(cluster_ids)
+        cost = np.full((n_dets, n_clusters), 1e6)
+        
+        for i, det in enumerate(valid_dets):
+            det_pos = det['pos'][[0, 2]]
+            for j, gid in enumerate(cluster_ids):
+                cluster = self.clusters[gid]
+                cluster_pos = cluster['pos'][[0, 2]]
+                dist = np.linalg.norm(det_pos - cluster_pos)
+                thresh = self.match_dist_confirmed if cluster['confirmed'] else self.match_dist_tentative
+                if dist < thresh:
+                    cost[i, j] = dist
+        
+        row_idx, col_idx = linear_sum_assignment(cost)
+        
+        matched_dets = set()
+        for r, c in zip(row_idx, col_idx):
+            cluster = self.clusters[cluster_ids[c]]
+            thresh = self.match_dist_confirmed if cluster['confirmed'] else self.match_dist_tentative
+            if cost[r, c] < thresh:
+                det = valid_dets[r]
+                gid = cluster_ids[c]
+                self._update_cluster(gid, det, now)
+                det['gid'] = gid
+                matched_dets.add(r)
+        
+        for i, det in enumerate(valid_dets):
+            if i not in matched_dets:
+                self._create_cluster(det, now)
+        
+        self._cleanup(now)
+        return door_dets
     
-    def _manage_states(self, now):
-        rem = [gid for gid, t in self.tracks.items() if (now - t['last_seen']).to_sec() > self.ttl]
-        for gid in rem: del self.tracks[gid]
-        for t in self.tracks.values():
-            if t['track_state'] == 'Tracked' and (now - t['last_seen']).to_sec() > 0.8:
-                t['track_state'] = 'Lost'
+    def _create_cluster(self, det, now):
+        gid = self.next_gid
+        self.next_gid += 1
+        self.clusters[gid] = {
+            'pos': det['pos'].copy(),
+            'last_seen': now,
+            'observations': 1,
+            'confirmed': False
+        }
+        det['gid'] = gid
+    
+    def _update_cluster(self, gid, det, now):
+        cluster = self.clusters[gid]
+        alpha = 0.2
+        cluster['pos'] = (1 - alpha) * cluster['pos'] + alpha * det['pos']
+        cluster['last_seen'] = now
+        cluster['observations'] += 1
+        
+        if not cluster['confirmed'] and cluster['observations'] >= self.min_observations:
+            cluster['confirmed'] = True
+            rospy.loginfo(f"[DoorMap] Cluster {gid} CONFIRMED (obs={cluster['observations']})")
+    
+    def _cleanup(self, now):
+        self._merge_close_clusters()
+        
+        expired = []
+        for gid, c in self.clusters.items():
+            ttl = self.ttl_confirmed if c['confirmed'] else self.ttl_tentative
+            if (now - c['last_seen']).to_sec() > ttl:
+                expired.append(gid)
+        for gid in expired:
+            del self.clusters[gid]
+    
+    def _merge_close_clusters(self):
+        merge_dist = CONFIG['cluster_merge_dist']
+        confirmed_ids = [gid for gid, c in self.clusters.items() if c['confirmed']]
+        if len(confirmed_ids) < 2:
+            return
+        
+        to_remove = set()
+        for i, gid1 in enumerate(confirmed_ids):
+            if gid1 in to_remove:
+                continue
+            c1 = self.clusters[gid1]
+            for gid2 in confirmed_ids[i+1:]:
+                if gid2 in to_remove:
+                    continue
+                c2 = self.clusters[gid2]
+                dist = np.linalg.norm(c1['pos'][[0,2]] - c2['pos'][[0,2]])
+                if dist < merge_dist:
+                    if c1['observations'] >= c2['observations']:
+                        c1['observations'] += c2['observations']
+                        to_remove.add(gid2)
+                        rospy.loginfo(f"[DoorMap] Merged cluster {gid2} into {gid1}")
+                    else:
+                        c2['observations'] += c1['observations']
+                        to_remove.add(gid1)
+                        rospy.loginfo(f"[DoorMap] Merged cluster {gid1} into {gid2}")
+                        break
+        
+        for gid in to_remove:
+            del self.clusters[gid]
+    
+    def is_confirmed(self, gid):
+        return gid in self.clusters and self.clusters[gid]['confirmed']
+
 
 class SnapSpaceNode:
     def __init__(self):
@@ -210,30 +296,42 @@ class SnapSpaceNode:
         r = rospkg.RosPack()
         calib_path = r.get_path('ces') + "/MOT/calibration file/2024-09-13-20-37-00-camchain.yaml"
         self.cameras = self._load_cameras(calib_path)
-        self.tracker = KalmanTracker(self.cameras)
+        
+        self.door_map = DoorMap()
+        
         self.model = YOLO(r.get_path('ces') + "/MOT/pretrained/3_27_witd_model.pt")
         self.bridge = CvBridge(); self.lock = threading.Lock()
         self.imgs = {k: None for k in ['cam0', 'cam1', 'cam2', 'cam3']}
         self.last_timestamps = {k: None for k in ['cam0', 'cam1', 'cam2', 'cam3']}
         
-        self.class_names = {0:"b", 1:"Glass", 2:"Handle", 3:"Metal", 4:"Wood"}
-        self.class_colors = {1:(0,255,255), 3:(0,255,0), 4:(255,0,255)}
+        self.sync_threshold = CONFIG['sync_threshold']
+        
         for c in ['front','rear','left','right']:
             cid = {'front':'cam0','rear':'cam1','left':'cam2','right':'cam3'}[c]
             rospy.Subscriber(f"/camera/image_raw_{c}", Image, self._img_cb, callback_args=cid)
 
     def _load_cameras(self, path):
         with open(path) as f: data = yaml.safe_load(f)
-        ground_h = rospy.get_param("~ground_height", 1.0)
+        ground_h = CONFIG['ground_height']
         cams = {}
+        
+        rospy.loginfo("=" * 60)
+        rospy.loginfo(f"[Camera Chain] ground_height = {ground_h}m")
+        
         for i in range(4):
             cid = f'cam{i}'
             T = np.eye(4)
-            if i > 0: # Simple chain T_0->1->2->3
+            if i > 0:
                 prev_T = cams[f'cam{i-1}'].T
-                T_rel = np.array(data[cid].get('T_cn_cnm1', np.eye(4)))
+                T_cn_cnm1 = np.array(data[cid].get('T_cn_cnm1', np.eye(4)))
+                T_rel = np.linalg.inv(T_cn_cnm1)
                 T = prev_T @ T_rel
+            
             cams[cid] = Camera(cid, data[cid], T, ground_h)
+            pos = T[:3, 3]
+            rospy.loginfo(f"[{cid}] Global pos: ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})")
+        
+        rospy.loginfo("=" * 60)
         return cams
 
     def _img_cb(self, msg, cid):
@@ -242,8 +340,9 @@ class SnapSpaceNode:
             if self.cameras[cid].map_x is None: self.cameras[cid].init_maps(img.shape[1], img.shape[0])
             img_u = self.cameras[cid].undistort(img)
             with self.lock: 
-                self.imgs[cid] = (img_u, msg.header.stamp) # Store with timestamp
-        except: pass
+                self.imgs[cid] = (img_u, msg.header.stamp)
+        except Exception as e:
+            rospy.logwarn_throttle(1.0, f"[{cid}] img_cb error: {e}")
 
     def spin(self):
         rate = rospy.Rate(10)
@@ -259,6 +358,11 @@ class SnapSpaceNode:
 
             if len(frames) < 4: rate.sleep(); continue
             
+            stamps = [current_stamps[cid].to_sec() for cid in ['cam0','cam1','cam2','cam3']]
+            if max(stamps) - min(stamps) > self.sync_threshold:
+                rate.sleep()
+                continue
+            
             is_new_frame = False
             for cid, stamp in current_stamps.items():
                 if self.last_timestamps[cid] is None or stamp > self.last_timestamps[cid]:
@@ -269,39 +373,109 @@ class SnapSpaceNode:
                 rate.sleep()
                 continue
 
-            self.last_timestamps = current_stamps
+            self.last_timestamps = current_stamps.copy()
             
             processed_results = []
-            times = {}
             for i, frame in enumerate(frames):
-                start_t = time.perf_counter()
                 result = self.model(frame, verbose=False)[0]
-                end_t = time.perf_counter()
-                
                 processed_results.append(result)
-                cam_name = {'cam0':'front', 'cam1':'rear', 'cam2':'left', 'cam3':'right'}[active_cams[i]]
-                times[cam_name] = (end_t - start_t) * 1000.0
 
-            log_msg = "[Segmentation Time] " + " | ".join([f"{k}: {v:.1f} ms" for k, v in times.items()])
-            rospy.loginfo_throttle(1.0, log_msg)
-
-            detections = self._process_yolo(processed_results, active_cams)
-            tracked_dets = self.tracker.update(detections, self.cameras)
-            self._vis(frames, active_cams, tracked_dets)
+            detections = self._process_yolo(processed_results, active_cams, frames)
+            
+            door_dets = [d for d in detections if d['cls'] == 1]
+            handle_dets = [d for d in detections if d['cls'] == 2]
+            
+            representatives, groups = fuse_dets_by_world_pos(door_dets)
+            representatives = self.door_map.update(representatives)
+            door_dets = propagate_gid_to_groups(representatives, groups)
+            
+            self._attribute_handles_to_doors(handle_dets, door_dets)
+            
+            all_dets = door_dets + handle_dets
+            self._vis(frames, active_cams, all_dets)
             
             rate.sleep()
 
-    def _process_yolo(self, results, active_cams):
+    def _attribute_handles_to_doors(self, handle_dets, door_dets):
+        min_score = CONFIG['handle_min_containment']
+        for handle in handle_dets:
+            handle['gid'] = -1
+            handle['parent_door'] = None
+            
+            h_cam = handle['cam']
+            h_box = handle['box']
+            h_mask = handle.get('mask')
+            
+            best_door, best_score = None, min_score
+            
+            for door in door_dets:
+                if door['cam'] != h_cam:
+                    continue
+                
+                d_mask = door.get('mask')
+                d_box = door['box']
+                
+                if h_mask is not None and d_mask is not None:
+                    h_area = (h_mask > 0.5).sum()
+                    if h_area == 0:
+                        continue
+                    intersection = np.logical_and(h_mask > 0.5, d_mask > 0.5).sum()
+                    score = intersection / h_area
+                else:
+                    score = compute_iou(h_box, d_box)
+                
+                if score > best_score:
+                    best_score = score
+                    best_door = door
+            
+            if best_door is not None:
+                handle['gid'] = best_door['gid']
+                handle['parent_door'] = best_door['gid']
+
+    def _get_mask_bottom_uv(self, mask, box, img_shape):
+        v_h, v_w = img_shape[:2]
+        if mask.shape[:2] != (v_h, v_w):
+            mask = cv2.resize(mask, (v_w, v_h), interpolation=cv2.INTER_NEAREST)
+        
+        ys, xs = np.where(mask > 0.5)
+        if len(ys) == 0:
+            return [(box[0] + box[2]) / 2, box[3]]
+        
+        max_y = ys.max()
+        bottom_xs = xs[ys == max_y]
+        return [(bottom_xs.min() + bottom_xs.max()) / 2, max_y]
+
+    def _process_yolo(self, results, active_cams, frames):
         all_dets_by_cam = {cid: [] for cid in active_cams}
+        yolo_conf = CONFIG['yolo_conf_thresh']
+        
         for i, res in enumerate(results):
             cid = active_cams[i]
             if not res.boxes: continue
+            
+            frame_h, frame_w = frames[i].shape[:2]
+            
             for j, box in enumerate(res.boxes):
                 raw_cls, conf = int(box.cls), float(box.conf)
-                if conf < 0.05 or raw_cls not in {1,3,4}: continue
-                det_data = {'cam':cid,'box':box.xyxy.cpu().numpy()[0],'conf':conf,'cls':raw_cls}
-                if res.masks and j < len(res.masks.data): det_data['mask'] = res.masks.data[j].cpu().numpy()
+                if conf < yolo_conf or raw_cls not in {1,2,3,4}: continue
+                
+                tracker_cls = 1 if raw_cls in {1, 3, 4} else 2
+                
+                det_data = {
+                    'cam': cid,
+                    'box': box.xyxy.cpu().numpy()[0],
+                    'conf': conf,
+                    'cls': tracker_cls,
+                    'raw_cls': raw_cls,
+                    'frame_shape': (frame_h, frame_w)
+                }
+                if res.masks is not None and j < len(res.masks.data):
+                    mask_raw = res.masks.data[j].cpu().numpy()
+                    if mask_raw.shape[:2] != (frame_h, frame_w):
+                        mask_raw = cv2.resize(mask_raw, (frame_w, frame_h), interpolation=cv2.INTER_NEAREST)
+                    det_data['mask'] = mask_raw
                 all_dets_by_cam[cid].append(det_data)
+        
         final_detections = []
         for cid, dets in all_dets_by_cam.items():
             if not dets: continue
@@ -309,11 +483,25 @@ class SnapSpaceNode:
             scores = np.array([d['conf'] for d in dets])
             indices = non_max_suppression(boxes, scores, iou_threshold=0.6)
             for idx in indices:
-                det = dets[idx]; xyxy = det['box']
-                uv = [(xyxy[0]+xyxy[2])/2, xyxy[3]]
-                pos = self.cameras[cid].pixel_to_world(uv[0], uv[1])
-                if pos is None: continue
-                det['pos'] = pos; det['gid'] = -1; det['uv'] = uv
+                det = dets[idx]
+                xyxy = det['box']
+                frame_shape = det.get('frame_shape', (480, 640))
+                
+                if det['cls'] == 1:
+                    if 'mask' in det:
+                        uv = self._get_mask_bottom_uv(det['mask'], xyxy, frame_shape)
+                    else:
+                        uv = [(xyxy[0]+xyxy[2])/2, xyxy[3]]
+                    
+                    pos = self.cameras[cid].pixel_to_world(uv[0], uv[1])
+                    if pos is None: continue
+                    det['pos'] = pos
+                    det['uv'] = uv
+                else:
+                    det['pos'] = np.array([0, 0, 0])
+                    det['uv'] = [(xyxy[0]+xyxy[2])/2, (xyxy[1]+xyxy[3])/2]
+                
+                det['gid'] = -1
                 final_detections.append(det)
         return final_detections
 
@@ -322,18 +510,48 @@ class SnapSpaceNode:
         for d in dets:
             cid, gid = d.get('cam'), d.get('gid', -1)
             if cid not in vis: continue
+            
             x1, y1, x2, y2 = map(int, d['box'])
-            color = (0, 255, 255) # Unified Yellow
-            cv2.rectangle(vis[cid], (x1, y1), (x2, y2), color, 2)
-            label = f"Door {gid if gid!=-1 else '?'} ({d['conf']:.2f})"
-            cv2.putText(vis[cid], label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+            tracker_cls = d.get('cls', 1)
+            is_confirmed = tracker_cls == 1 and self.door_map.is_confirmed(gid)
+            
+            # 문은 확정된 것만 표시
+            if tracker_cls == 1 and not is_confirmed:
+                continue
+            if tracker_cls == 1:
+                color = (0, 255, 0) if is_confirmed else (0, 255, 255)
+            else:
+                color = (255, 255, 0) if d.get('parent_door') else (128, 128, 128)
+            
+            if 'mask' in d:
+                mask = d['mask']
+                v_h, v_w = vis[cid].shape[:2]
+                if mask.shape[:2] != (v_h, v_w):
+                    mask = cv2.resize(mask, (v_w, v_h), interpolation=cv2.INTER_NEAREST)
+                overlay = np.zeros_like(vis[cid], dtype=np.uint8)
+                overlay[mask > 0.5] = color
+                vis[cid] = cv2.addWeighted(vis[cid], 1.0, overlay, 0.4, 0)
+
+            thickness = 3 if is_confirmed else 2
+            cv2.rectangle(vis[cid], (x1, y1), (x2, y2), color, thickness)
+            
+            if tracker_cls == 1:
+                status = "[OK]" if is_confirmed else ""
+                label = f"D{gid}{status} ({d['conf']:.2f})"
+            else:
+                parent = d.get('parent_door')
+                label = f"H->D{parent}" if parent else "Handle"
+            
+            cv2.putText(vis[cid], label, (x1, max(y1-10, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
         h, w = imgs[0].shape[:2]
         def get_img(k): return cv2.resize(vis.get(k, np.zeros((h,w,3),np.uint8)), (w,h))
         top = np.hstack((get_img('cam0'), get_img('cam2')))
         bottom = np.hstack((get_img('cam1'), get_img('cam3')))
         final = np.vstack((top, bottom))
-        cv2.imshow("SnapSpace Tracker (v14)", final)
+        cv2.imshow("SnapSpace Tracker", final)
         cv2.waitKey(1)
+
 
 if __name__ == '__main__':
     try: SnapSpaceNode().spin()
