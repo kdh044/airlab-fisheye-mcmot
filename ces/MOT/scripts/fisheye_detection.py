@@ -19,7 +19,7 @@ class YOLOSegMultiCam2x2:
         # ===============================
         # Model (고정 경로 - 도커 내부 절대 경로)
         # ===============================
-        self.model_path = "/root/catkin_ws/src/ces/MOT/pretrained/3_27_witd_model.pt"
+        self.model_path = "/root/catkin_ws/src/ces/MOT/pretrained/best.pt"
         self.model = YOLO(self.model_path)
         # GPU 사용 시
         # self.model.to("cuda")
@@ -28,23 +28,18 @@ class YOLOSegMultiCam2x2:
         # Class Info
         # ===============================
         self.class_names = {
-            0: "building",
-            1: "glass_door",
-            2: "handle",
-            3: "metal_door",
-            4: "wood_door"
+            0: "door",
+            1: "handle"
         }
 
-        # building 완전 배제
-        self.ignore_class_ids = {0}
 
         # 클래스별 색상
         self.class_colors = {
-            1: (0, 255, 255),   # glass_door
-            2: (0, 0, 255),     # handle
-            3: (0, 255, 0),     # metal_door
-            4: (255, 0, 255)    # wood_door
+            0: (0, 255, 255),   # door
+            1: (0, 0, 255),     # handle
         }
+        
+        self.ignore_class_ids = set()
 
         # ===============================
         # ROS / CV
